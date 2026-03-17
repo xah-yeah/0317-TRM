@@ -3,3 +3,5 @@ st-gsheets-connection
 openai
 pymupdf
 pandas
+beautifulsoup4
+requests
