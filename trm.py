@@ -30,9 +30,9 @@ def get_jd_from_url(url):
 def load_data():
     try:
         df = conn.read(ttl=0)
-        if df.empty:
+        if df is None or df.empty:
             return pd.DataFrame(columns=["name", "email", "career_summary", "position", "status", "revisit_date", "added_date"])
-        # 상태가 없는 사람을 '미분류'로 채움 (1번 문제 해결)
+        # 상태가 없는 사람을 '미분류'로 채움
         df['status'] = df['status'].fillna('미분류')
         return df
     except:
@@ -40,7 +40,7 @@ def load_data():
 
 df = load_data()
 
-# 채용 단계 설정 (2번 문제 해결: 스크리닝 추가)
+# 채용 단계 설정
 STATUS_OPTIONS = ["스크리닝", "컨택 중", "면접 진행", "최종 합격", "처우 협의", "불합격", "리비짓", "미분류"]
 
 # --- 3. UI 구성 ---
@@ -53,6 +53,4 @@ choice = st.sidebar.selectbox("메뉴", menu)
 if not df.empty:
     st.sidebar.divider()
     st.sidebar.subheader("📈 현재 파이프라인")
-    counts = df['status'].value_counts()
-    for s in STATUS_OPTIONS:
-        if s in counts: st.sidebar.write(f"{s}: **{counts
+    counts = df['
