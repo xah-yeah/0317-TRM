@@ -8,90 +8,147 @@ import fitz
 import requests
 from bs4 import BeautifulSoup
 
-# --- 설정 ---
+# --- 1. 설정 및 API 연결 ---
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# --- 데이터 로드 함수 ---
+def extract_text_from_pdf(file):
+    doc = fitz.open(stream=file.read(), filetype="pdf")
+    text = "".join([page.get_text() for page in doc])
+    return text
+
+def get_jd_from_url(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        for s in soup(["script", "style"]): s.decompose()
+        return soup.get_text()[:3000]
+    except: return "JD 로드 실패"
+
+# --- 2. 데이터 로드 및 전처리 ---
 def load_data():
     try:
-        return conn.read(ttl=0)
+        df = conn.read(ttl=0)
+        # 상태가 없는(None) 사람을 '미분류'로 채워줌 (1번 문제 해결)
+        df['status'] = df['status'].fillna('미분류')
+        return df
     except:
         return pd.DataFrame(columns=["name", "email", "career_summary", "position", "status", "revisit_date", "added_date"])
 
 df = load_data()
 
-# --- UI 설정 ---
-st.set_page_config(page_title="AI TRM Dashboard", layout="wide")
+# 채용 단계 설정 (2번 문제 해결: 스크리닝 추가)
+STATUS_OPTIONS = ["스크리닝", "컨택 중", "면접 진행", "최종 합격", "처우 협의", "불합격", "리비짓", "미분류"]
 
-# --- 사이드바: 메뉴 및 대시보드 통계 ---
+# --- 3. UI 구성 ---
+st.set_page_config(page_title="AI TRM Pro", layout="wide")
+
 st.sidebar.title("🎯 AI 채용 센터")
-menu = ["대시보드 & 파이프라인", "신규 후보자 등록", "리비짓 대상자"]
+menu = ["📊 대시보드 & 파이프라인", "➕ 신규 후보자 등록", "🔔 리비짓 대상자"]
 choice = st.sidebar.selectbox("메뉴", menu)
 
 if not df.empty:
     st.sidebar.divider()
-    st.sidebar.subheader("📊 실시간 현황")
-    status_counts = df['status'].value_counts()
-    for s_name, s_count in status_counts.items():
-        st.sidebar.write(f"**{s_name}**: {s_count}명")
+    st.sidebar.subheader("📈 현재 파이프라인")
+    counts = df['status'].value_counts()
+    for s in STATUS_OPTIONS:
+        if s in counts: st.sidebar.write(f"{s}: **{counts[s]}명**")
 
-# --- 기능 구현 ---
+# --- 4. 메뉴별 기능 구현 ---
 
-# 1. 대시보드 & 파이프라인 (상태 관리 핵심)
-if choice == "대시보드 & 파이프라인":
-    st.header("📊 채용 파이프라인 현황")
+# [메뉴 1: 대시보드]
+if choice == "📊 대시보드 & 파이프라인":
+    st.header("📊 전체 채용 현황")
     
-    # 상단 요약 카드
-    cols = st.columns(4)
-    cols[0].metric("전체 후보자", len(df))
-    cols[1].metric("컨택 중", len(df[df['status'] == '컨택 중']))
-    cols[2].metric("면접 진행", len(df[df['status'] == '면접 진행']))
-    cols[3].metric("리비짓 대상", len(df[df['status'].str.contains('리비짓', na=False)]))
+    # 상단 요약
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("전체", len(df))
+    m2.metric("스크리닝/컨택", len(df[df['status'].isin(['스크리닝', '컨택 중'])]))
+    m3.metric("면접 진행", len(df[df['status'] == '면접 진행']))
+    m4.metric("리비짓", len(df[df['status'] == '리비짓']))
 
     st.divider()
 
-    # 필터 및 편집
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        st.subheader("⚙️ 리스트 필터")
-        pos_filter = st.multiselect("포지션 선택", options=df['position'].unique(), default=df['position'].unique())
-        status_filter = st.multiselect("상태 선택", options=["컨택 중", "면접 진행", "최종 합격", "처우 협의", "불합격", "리비짓"], default=["컨택 중", "면접 진행", "최종 합격"])
+    # 필터 영역
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        st.write("### ⚙️ 필터")
+        pos_f = st.multiselect("포지션", options=df['position'].unique(), default=df['position'].unique())
+        stat_f = st.multiselect("단계", options=STATUS_OPTIONS, default=["스크리닝", "컨택 중", "면접 진행"])
     
-    with col2:
-        st.subheader("📝 상태 변경 및 정보 수정")
-        view_df = df[(df['position'].isin(pos_filter)) & (df['status'].isin(status_filter))]
+    with c2:
+        st.write("### 📝 리스트 관리")
+        view_df = df[(df['position'].isin(pos_f)) & (df['status'].isin(stat_f))]
         
-        # 데이터 에디터 (여기서 Status 열을 드롭다운처럼 수정 가능)
         edited_df = st.data_editor(
             view_df,
             column_config={
-                "status": st.column_config.SelectboxColumn(
-                    "채용 상태",
-                    options=["컨택 중", "면접 진행", "최종 합격", "처우 협의", "불합격", "리비짓"],
-                    required=True,
-                )
+                "status": st.column_config.SelectboxColumn("상태 변경", options=STATUS_OPTIONS, required=True)
             },
-            use_container_width=True,
-            num_rows="dynamic"
+            use_container_width=True, num_rows="dynamic"
         )
 
-    if st.button("💾 변경사항 구글 시트에 최종 반영"):
-        # 수정된 내용 합치기 로직
+    if st.button("💾 변경사항 구글 시트에 저장"):
         df.update(edited_df)
         final_df = pd.concat([df, edited_df[~edited_df.index.isin(df.index)]])
         conn.create(data=final_df)
-        st.success("데이터가 성공적으로 업데이트되었습니다!")
+        st.success("업데이트 완료!")
         st.rerun()
 
-# 2. 신규 후보자 등록 (기존 로직 유지)
-elif choice == "신규 후보자 등록":
-    st.header("📄 신규 이력서 분석")
-    # ... (기존 이력서 업로드 및 분석 코드 동일)
-    st.info("이력서를 업로드하면 AI가 자동으로 요약하고 '컨택 중' 상태로 등록합니다.")
+# [메뉴 2: 등록 - 3번 문제 해결: 업로드 UI 복구]
+elif choice == "➕ 신규 후보자 등록":
+    st.header("📄 신규 후보자 분석 및 등록")
+    st.info("이력서를 업로드하면 AI가 요약한 뒤 기본적으로 '스크리닝' 단계로 등록합니다.")
+    
+    col_up1, col_up2 = st.columns(2)
+    with col_up1:
+        target_pos = st.text_input("채용 포지션 (예: SE, Backend)")
+        uploaded_file = st.file_uploader("이력서 PDF 파일 업로드", type="pdf")
+    with col_up2:
+        jd_mode = st.radio("JD 입력 방식", ["주소(URL) 넣기", "내용 직접 쓰기"])
+        jd_val = st.text_input("공고 URL") if jd_mode == "주소(URL) 넣기" else st.text_area("공고 내용")
 
-# 3. 리비짓 알림
-elif choice == "리비짓 대상자":
-    st.header("🔔 리비짓 관리")
-    revisit_df = df[df['status'] == '리비짓']
-    st.dataframe(revisit_df, use_container_width=True)
+    if uploaded_file and target_pos and jd_input := jd_val:
+        if st.button("🔍 AI 분석 시작"):
+            raw = extract_text_from_pdf(uploaded_file)
+            db_json = df[['name', 'career_summary']].to_json(orient='records', force_ascii=False)
+            final_jd = get_jd_from_url(jd_val) if jd_mode == "주소(URL) 넣기" else jd_val
+            
+            with st.spinner('AI 분석 중...'):
+                prompt = f"후보자 정보 추출 및 JD 매칭 제안서 작성. JSON 응답: {{\"name\":\"\",\"email\":\"\",\"summary\":\"\",\"similarity\":0,\"matched_name\":\"\",\"draft_message\":\"\"}}"
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{"role":"user","content":prompt + f"\n\nJD: {final_jd}\n\n이력서: {raw}"}],
+                    response_format={"type":"json_object"}
+                )
+                st.session_state['last_res'] = json.loads(response.choices[0].message.content)
+                st.session_state['curr_pos'] = target_pos
+
+    if 'last_res' in st.session_state:
+        res = st.session_state['last_res']
+        st.divider()
+        if res['similarity'] > 70: st.error(f"🚨 중복 의심: {res['matched_name']} ({res['similarity']}%)")
+        else: st.success(f"✅ 신규 후보자: {res['name']}님")
+        
+        st.subheader("✉️ AI 제안 메시지")
+        st.info(res['draft_message'])
+        
+        if st.button("📥 DB에 '스크리닝' 단계로 저장"):
+            new_data = {
+                "name": res['name'], "email": res['email'], "career_summary": res['summary'],
+                "position": st.session_state['curr_pos'], "status": "스크리닝", 
+                "added_date": datetime.now().strftime("%Y-%m-%d")
+            }
+            # 최신화 후 저장
+            latest_df = conn.read(ttl=0)
+            updated_df = pd.concat([latest_df, pd.DataFrame([new_data])], ignore_index=True)
+            conn.create(data=updated_df)
+            st.balloons()
+            st.success("저장 성공! '대시보드'에서 확인하세요.")
+            del st.session_state['last_res'] # 저장 후 초기화
+
+# [메뉴 3: 리비짓]
+elif choice == "🔔 리비짓 대상자":
+    st.header("🔔 다시 연락해볼 후보자들")
+    st.dataframe(df[df['status'] == '리비짓'], use_container_width=True)
