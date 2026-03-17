@@ -10,6 +10,7 @@ import fitz  # PyMuPDF
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 conn = st.connection("gsheets", type=GSheetsConnection)
 
+# PDF 텍스트 추출
 def extract_text_from_pdf(file):
     doc = fitz.open(stream=file.read(), filetype="pdf")
     text = ""
@@ -17,115 +18,114 @@ def extract_text_from_pdf(file):
         text += page.get_text()
     return text
 
-def analyze_resume(text, db_data_json):
-    prompt = f"""당신은 전문 채용 담당자입니다. 이력서를 분석하여 JSON으로만 응답하세요.
+# AI 분석 및 메시지 생성 함수
+def analyze_and_draft(text, db_data_json, job_description=""):
+    prompt = f"""당신은 전문 채용 담당자입니다. 아래 지침에 따라 JSON으로만 응답하세요.
+    
     [미션]
-    1. 후보자의 성함(name), 이메일(email), 경력 및 학력 요약(summary)을 추출하세요.
-    2. 아래 제공된 기존 DB 데이터와 비교하여 동일인일 확률이 가장 높은 사람을 찾으세요.
-    3. 동일인 확률(similarity, 0-100)과 해당 인물의 이름(matched_name)을 결과에 포함하세요.
-    4. 만약 기존 DB가 비어있다면 similarity는 0으로 응답하세요.
-    [기존 DB 데이터]
-    {db_data_json}
+    1. 후보자 정보 추출: name, email, summary(경력/학력)
+    2. 중복 체크: 기존 DB({db_data_json})와 대조하여 similarity(0-100)와 matched_name 추출.
+    3. 개인화 메시지: 아래 제공된 JD를 바탕으로 후보자의 강점을 언급하며 우리 회사에 입사 제안을 하는 따뜻한 메시지를 작성하세요.
+    
+    [우리 회사 JD]
+    {job_description}
+    
     [응답 양식]
     {{
-        "name": "후보자 이름",
+        "name": "이름",
         "email": "이메일",
-        "summary": "경력 및 학력 요약(회사명, 학교명 포함)",
+        "summary": "요약",
         "similarity": 85,
-        "matched_name": "DB 내 유사 인물 이름 (없으면 빈칸)"
+        "matched_name": "유사 인물",
+        "draft_message": "안녕하세요 OOO님, 이력서를 검토하며 ... (메시지 내용)"
     }}"""
+
     response = client.chat.completions.create(
         model="gpt-4o",
-        messages=[{"role": "user", "content": prompt + "\n\n[분석할 이력서 텍스트]\n" + text}],
+        messages=[{"role": "user", "content": prompt + "\n\n[이력서]\n" + text}],
         response_format={"type": "json_object"}
     )
     return json.loads(response.choices[0].message.content)
 
-# --- 2. UI 화면 구성 ---
-st.set_page_config(page_title="AI TRM System", layout="wide")
-st.title("🎯 AI 채용 관리 시스템 (TRM)")
-
+# --- 2. 데이터 로드 ---
 try:
+    # 실시간 데이터 강제 로드
     df = conn.read(ttl="0")
 except:
     df = pd.DataFrame(columns=["name", "email", "career_summary", "position", "status", "revisit_date", "added_date"])
 
-menu = ["후보자 등록/분석", "파이프라인 관리", "리비짓 알림"]
-choice = st.sidebar.selectbox("Menu", menu)
+# --- 3. UI 구성 ---
+st.set_page_config(page_title="AI TRM System", layout="wide")
+st.title("🎯 AI 채용 관리 시스템 (TRM)")
 
-# --- 3. 메뉴별 기능 구현 ---
+# 사이드바 메뉴 및 필터
+st.sidebar.header("📌 Menu")
+menu = ["후보자 등록/분석", "파이프라인 관리", "리비짓 알림"]
+choice = st.sidebar.selectbox("이동하기", menu)
+
+# 추가 기능: 사이드바 포지션 필터
+st.sidebar.divider()
+st.sidebar.header("🔍 포지션 필터")
+all_pos = ["전체"] + sorted(df['position'].unique().tolist()) if not df.empty else ["전체"]
+sidebar_pos = st.sidebar.radio("보고 싶은 포지션 선택", all_pos)
+
+# --- 4. 기능 구현 ---
 
 if choice == "후보자 등록/분석":
     st.header("📄 신규 이력서 분석")
-    pos = st.text_input("채용 포지션 (예: SE, 마케터, 개발자)")
-    uploaded_file = st.file_uploader("PDF 이력서 업로드", type="pdf")
+    
+    col_a, col_b = st.columns(2)
+    with col_a:
+        pos = st.text_input("채용 포지션")
+        uploaded_file = st.file_uploader("PDF 이력서 업로드", type="pdf")
+    with col_b:
+        jd_input = st.text_area("우리 회사 JD (여기에 붙여넣으면 개인화 메시지가 생성됩니다)", height=150)
     
     if uploaded_file and pos:
         raw_text = extract_text_from_pdf(uploaded_file)
         db_subset = df[['name', 'career_summary']].to_json(orient='records', force_ascii=False) if not df.empty else "[]"
         
-        with st.spinner('AI 분석 중...'):
-            result = analyze_resume(raw_text, db_subset)
+        with st.spinner('AI가 분석 및 메시지를 작성 중입니다...'):
+            result = analyze_and_draft(raw_text, db_subset, jd_input)
         
         st.divider()
         if result['similarity'] > 70:
-            st.error(f"🚨 중복 의심: 기존 DB의 **[{result['matched_name']}]**님과 유사도 {result['similarity']}%")
+            st.error(f"🚨 중복 의심: [{result['matched_name']}]님과 유사도 {result['similarity']}%")
         else:
-            st.success(f"✅ 신규 후보자입니다! (유사도 {result['similarity']}%)")
-            st.info(f"**분석된 정보:** {result['name']} / {result['email']}")
-            st.write(f"**요약:** {result['summary']}")
+            st.success(f"✅ 신규 후보자 ({result['name']}님)")
+
+        # 개인화 메시지 표시
+        st.subheader("✉️ AI 제안 메시지 초안")
+        st.info(result['draft_message'])
         
-        if st.button("DB(구글 시트)에 저장하기"):
-            new_data = pd.DataFrame([{
-                "name": result['name'], 
-                "email": result['email'], 
-                "career_summary": result['summary'],
-                "position": pos, 
-                "status": "컨택 중", 
-                "revisit_date": "", 
-                "added_date": datetime.now().strftime("%Y-%m-%d")
-            }])
-            updated_df = pd.concat([df, new_data], ignore_index=True)
+        if st.button("DB(구글 시트)에 최종 저장"):
+            new_row = {
+                "name": result['name'], "email": result['email'], "career_summary": result['summary'],
+                "position": pos, "status": "컨택 중", "revisit_date": "", "added_date": datetime.now().strftime("%Y-%m-%d")
+            }
+            # 저장 로직 보강
+            updated_df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
             conn.update(data=updated_df)
             st.balloons()
-            st.success(f"{result['name']}님의 정보가 저장되었습니다!")
+            st.success("구글 시트에 성공적으로 저장되었습니다!")
 
 elif choice == "파이프라인 관리":
-    st.header("📊 채용 파이프라인 관리")
-    col1, col2 = st.columns(2)
-    with col1:
-        available_positions = ["전체"] + sorted(df['position'].unique().tolist()) if not df.empty else ["전체"]
-        selected_pos = st.selectbox("🎯 직무/포지션별 필터", available_positions)
-    with col2:
-        search_q = st.text_input("🔍 통합 검색 (이름, 회사명, 학교명 등)", placeholder="예: 삼성전자, 서울대")
-
-    filtered_df = df.copy()
-    if selected_pos != "전체":
-        filtered_df = filtered_df[filtered_df['position'] == selected_pos]
-    if search_q:
-        filtered_df = filtered_df[
-            filtered_df['name'].str.contains(search_q, na=False, case=False) | 
-            filtered_df['career_summary'].str.contains(search_q, na=False, case=False)
-        ]
-
-    st.write(f"검색 결과: **{len(filtered_df)}** 명")
-    edited_df = st.data_editor(filtered_df, num_rows="dynamic", use_container_width=True)
+    st.header(f"📊 {sidebar_pos} 파이프라인")
     
-    if st.button("변경사항 저장 (구글 시트 동기화)"):
-        # 인덱스를 기준으로 원본 데이터 업데이트
-        for idx, row in edited_df.iterrows():
-            df.loc[idx] = row
-        # 새로운 행 추가 (인덱스가 기존 df에 없는 경우)
-        new_rows = edited_df[~edited_df.index.isin(df.index)]
-        final_df = pd.concat([df, new_rows])
-        conn.update(data=final_df)
-        st.success("데이터가 성공적으로 업데이트되었습니다!")
+    # 사이드바 필터 적용
+    display_df = df.copy()
+    if sidebar_pos != "전체":
+        display_df = display_df[display_df['position'] == sidebar_pos]
+    
+    search_q = st.text_input("🔍 키워드 검색 (이름/회사/학교)")
+    if search_q:
+        display_df = display_df[display_df.apply(lambda row: search_q.lower() in str(row).lower(), axis=1)]
 
-elif choice == "리비짓 알림":
-    st.header("🔔 리비짓(재컨택) 대상자")
-    if not df.empty:
-        revisit_list = df[df['status'].str.contains('리비짓', na=False, case=False)]
-        if not revisit_list.empty:
-            st.dataframe(revisit_list, use_container_width=True)
-        else:
-            st.info("현재 리비짓 상태인 후보자가 없습니다.")
+    edited_df = st.data_editor(display_df, num_rows="dynamic", use_container_width=True)
+    
+    if st.button("변경사항 저장"):
+        # 수정된 내용 병합 후 저장
+        df.update(edited_df)
+        final_save = pd.concat([df, edited_df[~edited_df.index.isin(df.index)]])
+        conn.update(data=final_save)
+        st.success("동기화 완료!")
