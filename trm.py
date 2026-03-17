@@ -4,150 +4,114 @@ import pandas as pd
 from datetime import datetime
 import json
 from openai import OpenAI
-import fitz
-import requests
-from bs4 import BeautifulSoup
+import fitz  # PyMuPDF
 
 # --- 1. 설정 및 API 연결 ---
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+# 구글 시트 연결 설정
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 def extract_text_from_pdf(file):
     doc = fitz.open(stream=file.read(), filetype="pdf")
-    text = "".join([page.get_text() for page in doc])
+    text = ""
+    for page in doc:
+        text += page.get_text()
     return text
 
-def get_jd_from_url(url):
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        for s in soup(["script", "style"]): s.decompose()
-        return soup.get_text()[:3000]
-    except: return "JD 로드 실패"
+def analyze_and_draft(text, db_data_json, job_description=""):
+    prompt = f"""당신은 전문 채용 담당자입니다. 아래 지침에 따라 JSON으로만 응답하세요.
+    1. 후보자 정보 추출: name, email, summary(경력/학력)
+    2. 중복 체크: 기존 DB({db_data_json})와 대조하여 similarity(0-100)와 matched_name 추출.
+    3. 개인화 메시지 작성: 제공된 JD를 바탕으로 따뜻한 영입 메시지 작성.
+    [우리 회사 JD]: {job_description}
+    [응답 양식]: {{"name":"", "email":"", "summary":"", "similarity":0, "matched_name":"", "draft_message":""}}"""
 
-# --- 2. 데이터 로드 및 전처리 ---
-def load_data():
-    try:
-        df = conn.read(ttl=0)
-        if df is None or df.empty:
-            return pd.DataFrame(columns=["name", "email", "career_summary", "position", "status", "revisit_date", "added_date"])
-        # 상태가 없는 사람을 '미분류'로 채움
-        df['status'] = df['status'].fillna('미분류')
-        return df
-    except:
-        return pd.DataFrame(columns=["name", "email", "career_summary", "position", "status", "revisit_date", "added_date"])
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt + "\n\n[이력서]\n" + text}],
+        response_format={"type": "json_object"}
+    )
+    return json.loads(response.choices[0].message.content)
 
-df = load_data()
+# --- 2. 데이터 로드 ---
+try:
+    # 실시간 데이터 로드 (캐시 0초)
+    df = conn.read(ttl=0)
+except Exception as e:
+    st.error(f"데이터를 불러오지 못했습니다: {e}")
+    df = pd.DataFrame(columns=["name", "email", "career_summary", "position", "status", "revisit_date", "added_date"])
 
-# 채용 단계 설정
-STATUS_OPTIONS = ["스크리닝", "컨택 중", "면접 진행", "최종 합격", "처우 협의", "불합격", "리비짓", "미분류"]
+# --- 3. UI 구성 (사이드바 필터 포함) ---
+st.set_page_config(page_title="AI TRM System", layout="wide")
+st.title("🎯 AI 채용 관리 시스템 (TRM)")
 
-# --- 3. UI 구성 ---
-st.set_page_config(page_title="AI TRM Pro", layout="wide")
+# 메뉴 및 사이드바 포지션 필터
+menu = ["후보자 등록/분석", "파이프라인 관리", "리비짓 알림"]
+choice = st.sidebar.selectbox("📌 Menu", menu)
 
-st.sidebar.title("🎯 AI 채용 센터")
-menu = ["📊 대시보드 & 파이프라인", "➕ 신규 후보자 등록", "🔔 리비짓 대상자"]
-choice = st.sidebar.selectbox("메뉴", menu)
+st.sidebar.divider()
+st.sidebar.header("🔍 포지션 필터")
+all_pos = ["전체"] + sorted(df['position'].unique().tolist()) if not df.empty else ["전체"]
+sidebar_pos = st.sidebar.radio("보고 싶은 포지션 선택", all_pos)
 
-if not df.empty:
-    st.sidebar.divider()
-    st.sidebar.subheader("📈 현재 파이프라인")
-    # 에러가 났던 지점: 정확히 닫힌 문자열
-    counts = df['status'].value_counts()
-    for s in STATUS_OPTIONS:
-        if s in counts:
-            st.sidebar.write(f"{s}: **{counts[s]}명**")
+# --- 4. 기능 구현 ---
 
-# --- 4. 메뉴별 기능 구현 ---
-
-if choice == "📊 대시보드 & 파이프라인":
-    st.header("📊 전체 채용 현황")
+if choice == "후보자 등록/분석":
+    st.header("📄 신규 이력서 분석")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        pos = st.text_input("채용 포지션")
+        uploaded_file = st.file_uploader("PDF 이력서 업로드", type="pdf")
+    with col_b:
+        jd_input = st.text_area("우리 회사 JD (개인화 메시지용)", height=150)
     
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("전체", len(df))
-    m2.metric("스크리닝/컨택", len(df[df['status'].isin(['스크리닝', '컨택 중'])]))
-    m3.metric("면접 진행", len(df[df['status'] == '면접 진행']))
-    m4.metric("리비짓", len(df[df['status'] == '리비짓']))
-
-    st.divider()
-
-    c1, c2 = st.columns([1, 3])
-    with c1:
-        st.write("### ⚙️ 필터")
-        pos_list = df['position'].unique().tolist() if not df.empty else []
-        pos_f = st.multiselect("포지션", options=pos_list, default=pos_list)
-        stat_f = st.multiselect("단계", options=STATUS_OPTIONS, default=["스크리닝", "컨택 중", "면접 진행", "미분류"])
-    
-    with c2:
-        st.write("### 📝 리스트 관리")
-        view_df = df[(df['position'].isin(pos_f)) & (df['status'].isin(stat_f))]
+    if uploaded_file and pos:
+        raw_text = extract_text_from_pdf(uploaded_file)
+        db_subset = df[['name', 'career_summary']].to_json(orient='records', force_ascii=False) if not df.empty else "[]"
         
-        edited_df = st.data_editor(
-            view_df,
-            column_config={
-                "status": st.column_config.SelectboxColumn("상태 변경", options=STATUS_OPTIONS, required=True)
-            },
-            use_container_width=True, num_rows="dynamic"
-        )
-
-    if st.button("💾 변경사항 구글 시트에 저장"):
-        df.update(edited_df)
-        final_df = pd.concat([df, edited_df[~edited_df.index.isin(df.index)]])
-        conn.create(data=final_df)
-        st.success("업데이트 완료!")
-        st.rerun()
-
-elif choice == "➕ 신규 후보자 등록":
-    st.header("📄 신규 후보자 분석 및 등록")
-    st.info("이력서를 업로드하면 AI가 분석한 뒤 기본적으로 '스크리닝' 단계로 등록합니다.")
-    
-    col_up1, col_up2 = st.columns(2)
-    with col_up1:
-        target_pos = st.text_input("채용 포지션 (예: SE, Backend)")
-        uploaded_file = st.file_uploader("이력서 PDF 파일 업로드", type="pdf")
-    with col_up2:
-        jd_mode = st.radio("JD 입력 방식", ["주소(URL) 넣기", "내용 직접 쓰기"])
-        jd_val = st.text_input("공고 URL") if jd_mode == "주소(URL) 넣기" else st.text_area("공고 내용")
-
-    if uploaded_file and target_pos and jd_val:
-        if st.button("🔍 AI 분석 시작"):
-            raw = extract_text_from_pdf(uploaded_file)
-            db_json = df[['name', 'career_summary']].to_json(orient='records', force_ascii=False)
-            final_jd = get_jd_from_url(jd_val) if jd_mode == "주소(URL) 넣기" else jd_val
-            
-            with st.spinner('AI 분석 중...'):
-                prompt = "이력서 분석 JSON 응답: {\"name\":\"\",\"email\":\"\",\"summary\":\"\",\"similarity\":0,\"matched_name\":\"\",\"draft_message\":\"\"}"
-                response = client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[{"role":"user","content": f"{prompt}\n\nJD: {final_jd}\n\n이력서: {raw}"}],
-                    response_format={"type":"json_object"}
-                )
-                st.session_state['last_res'] = json.loads(response.choices[0].message.content)
-                st.session_state['curr_pos'] = target_pos
-
-    if 'last_res' in st.session_state:
-        res = st.session_state['last_res']
+        with st.spinner('AI 분석 중...'):
+            result = analyze_and_draft(raw_text, db_subset, jd_input)
+        
         st.divider()
-        if res['similarity'] > 70: st.error(f"🚨 중복 의심: {res['matched_name']} ({res['similarity']}%)")
-        else: st.success(f"✅ 신규 후보자: {res['name']}님")
-        
-        st.subheader("✉️ AI 제안 메시지")
-        st.info(res['draft_message'])
-        
-        if st.button("📥 DB에 '스크리닝' 단계로 저장"):
-            new_data = {
-                "name": res['name'], "email": res['email'], "career_summary": res['summary'],
-                "position": st.session_state['curr_pos'], "status": "스크리닝", 
-                "added_date": datetime.now().strftime("%Y-%m-%d")
-            }
-            latest_df = conn.read(ttl=0)
-            updated_df = pd.concat([latest_df, pd.DataFrame([new_data])], ignore_index=True)
-            conn.create(data=updated_df)
-            st.balloons()
-            st.success("저장 성공!")
-            del st.session_state['last_res']
+        if result['similarity'] > 70:
+            st.error(f"🚨 중복 의심: [{result['matched_name']}]님과 유사도 {result['similarity']}%")
+        else:
+            st.success(f"✅ 신규 후보자 ({result['name']}님)")
 
-elif choice == "🔔 리비짓 대상자":
-    st.header("🔔 리비짓 관리")
-    st.dataframe(df[df['status'] == '리비짓'], use_container_width=True)
+        st.subheader("✉️ AI 제안 메시지 초안")
+        st.info(result['draft_message'])
+        
+        if st.button("DB(구글 시트)에 최종 저장"):
+            new_row = pd.DataFrame([{
+                "name": result['name'], "email": result['email'], "career_summary": result['summary'],
+                "position": pos, "status": "컨택 중", "revisit_date": "", "added_date": datetime.now().strftime("%Y-%m-%d")
+            }])
+            # 기존 데이터에 새 데이터 합치기
+            final_df = pd.concat([df, new_row], ignore_index=True)
+            # 구글 시트에 다시 쓰기 (create가 가장 확실함)
+            conn.create(data=final_df)
+            st.balloons()
+            st.success("구글 시트에 성공적으로 저장되었습니다!")
+
+elif choice == "파이프라인 관리":
+    st.header(f"📊 {sidebar_pos} 파이프라인")
+    
+    # 필터링 적용
+    display_df = df.copy()
+    if sidebar_pos != "전체":
+        display_df = display_df[display_df['position'] == sidebar_pos]
+    
+    search_q = st.text_input("🔍 키워드 검색 (이름/회사/학교)")
+    if search_q:
+        display_df = display_df[display_df.apply(lambda row: search_q.lower() in str(row).lower(), axis=1)]
+
+    st.write(f"현재 결과: {len(display_df)}명")
+    # 인덱스 숨기기 및 에디터 출력
+    edited_df = st.data_editor(display_df, num_rows="dynamic", use_container_width=True)
+    
+    if st.button("변경사항 저장"):
+        # 수정된 내용 반영하여 전체 저장
+        df.update(edited_df)
+        final_save = pd.concat([df, edited_df[~edited_df.index.isin(df.index)]])
+        conn.create(data=final_save)
+        st.success("구글 시트 동기화 완료!")
